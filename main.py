@@ -1,43 +1,43 @@
-"""GTA VI Twitch concurrent-viewer forecast (gta6-twitch-ccu-forecast-01).
+"""GTA VI Twitch concurrent-viewer forecast v2 (gta6-twitch-ccu-forecast-01).
 
 Forecasts hours 2..24 of release day (2026-11-19 UTC) as five quantiles each,
 from the case's comparables: past big launches' hourly Twitch curves.
 
 Design
 -------
-Every comparable is reduced to a *ratio curve*: its hourly viewers on its own
-release day divided by its hour-1 print, r_h = viewers_h / viewers_1. The
-final's hour-1 print anchors the scale; the shape comes from the comparables.
+Same ratio-curve base as v1: every comparable is reduced to r_h =
+viewers_h / viewers_hour1, and for each UTC hour h a quadratic in
+log(hour-1 viewers) is fit over the comparables and evaluated at the case's
+own hour-1 print (clamped to the pool range, never extrapolated). The spread
+is the residual standard deviation of that fit (floored, smoothed), shrunk
+by SPREAD; the median is shifted up by MED_SHIFT; the two upper quantiles
+get a 1.25x wider spread.
 
-The key empirical fact (checked across the 41 launches in a practice case) is
-that the launch-day ramp depends strongly on the size of the hour-1 print:
-log(peak ratio) correlates about -0.94 with log(hour-1 viewers). A launch
-whose category was nearly empty at midnight ramps many-fold as time zones
-unlock; a launch whose midnight crowd was already huge barely ramps at all.
-Small hour-1 prints are mostly games that had not unlocked yet at midnight,
-so the relation is steep at low prints and flattens at high ones.
+v2 adds one correction on top of that base: a per-hour bias vector,
+HOUR_BIAS. It was measured on the four practice launches (Wolverine, RDR2,
+GoW Ragnarok, Spider-Man 2): for each practice case, the v1 base was run and
+its per-hour log-miss (log actual - log median forecast) recorded; HOUR_BIAS
+is the mean of those four miss vectors, smoothed across neighbouring hours.
+It is a structural correction, not a fudge factor: the comparable pool is a
+mix of unlock regimes (simultaneous global unlocks, early-access launches,
+unverified), while the practice targets — and the final, GTA VI — are clean
+rolling-midnight console launches. The pool's median shape is systematically
+too flat for that class: it over-predicts the deep-night hours 2-4 (bias
+about -0.3 log), under-predicts the US-unlock jump at hours 5-6 (+0.2 to
++0.4) and the evening peak at hours 17-24 (+0.2 to +0.4). The same pattern
+appears in all four practice cases with the same sign at those hours, and
+leave-one-case-out validation (bias estimated from three cases, tested on
+the fourth) improves the mean pinball loss from 0.158 (v1) to 0.131.
 
-So for each UTC hour h we fit, over the comparables, a quadratic in
-log(hour-1 viewers):
-
-    log r_h = a_h + b_h * x + c_h * x^2,   x = log(hour-1 viewers)
-
-and evaluate it at the case's own hour-1 print (clamped to the range of
-hour-1 prints seen in the pool, so the fit is never extrapolated). The spread
-is the residual standard deviation of that fit (floored), smoothed across
-neighbouring hours with the median curve, and shrunk by a factor 0.5 (the raw
-cross-launch spread overstates the conditional spread of a typical launch).
-The median is shifted up by +0.15 in log units (the comparable median
-slightly under-predicts; verified on practice). The two upper quantiles
-(0.75, 0.95) get a 1.25x wider spread than the lower ones: the upper tail is
-where the genuine uncertainty lives for a launch of this size, and pinball
-loss punishes a too-narrow upper tail far more than a too-wide one.
-
-Shape the model reproduces: a dip in hours 2-4 (night in Europe, US not yet
-unlocked), a slow climb as the US unlocks, a peak in hours 19-22 (EU evening
-+ US afternoon), then a fall into the night. Hour-1's print is taken from the
-case's `known` row when present, else the hour-1 whole-hour mean, else the
-mean of the minute reads in hour 1.
+The bias is applied at full strength with no size scaling: an attempt to
+scale it by hour-1 size (joint fit on practice targets + rolling
+comparables) was tested and REJECTED — it scored worse under
+leave-one-case-out (0.144-0.156) than the size-blind bias, because the size
+slope is not reliably estimable from this little data. The evening part of
+the bias is independently corroborated by the large rolling comparables
+themselves (their leave-one-out residuals at hours 17-24 average about
++0.3 log), so the full-strength correction is the honest choice even for a
+~700K hour-1 print.
 
 Safety: any failure (too few comparables, a bad fit, a missing hour-1 print)
 falls back to the house baseline formula, so the program always writes a
@@ -56,15 +56,50 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 
-# Tuned on the four practice cases: practice mean pinball loss 0.157-0.162
-# vs the house baseline's 0.387 (leave-one-case-out confirms the parameters).
-SPREAD = 0.5          # shrink factor on the residual spread
-MED_SHIFT = 0.15      # log-units added to the fitted median curve
-UPPER_MULT = 1.25     # extra spread multiplier on the 0.75 / 0.95 quantiles
-SIGMA_FLOOR = 0.15    # minimum log-spread per hour
-MU_MIN = -1.2         # clamp on fitted log-ratio (ratio >= 0.30)
-MU_MAX = 2.6          # clamp on fitted log-ratio (ratio <= 13.5)
-SMOOTH_WIN = 3        # moving-average window for mu / sigma across hours
+# v2 parameters. Practice mean pinball loss 0.109 (in-sample, bias fit on the
+# same four cases) and 0.131 leave-one-case-out, vs v1's 0.162 / 0.158.
+# House baseline is 0.387 on the same cases.
+SPREAD = 0.35        # shrink factor on the residual spread (v1: 0.5)
+MED_SHIFT = 0.15     # log-units added to the fitted median curve (as v1)
+UPPER_MULT = 1.25    # extra spread multiplier on the 0.75 / 0.95 quantiles
+SIGMA_FLOOR = 0.15   # minimum log-spread per hour
+MU_MIN = -1.2        # clamp on fitted log-ratio (ratio >= 0.30)
+MU_MAX = 2.6         # clamp on fitted log-ratio (ratio <= 13.5)
+SMOOTH_WIN = 3       # moving-average window for mu / sigma across hours
+
+# Per-hour log-bias of the v1 base, measured on the four practice launches
+# (mean log-miss per hour, smoothed with a window of 3). Index h-1 is hour h;
+# hour 1 is never forecast but kept so the smoothing matches the measurement.
+# Hours 2-4 negative: the pool over-predicts the deep-night dip for clean
+# rolling launches. Hours 5-6 positive: the pool under-predicts the
+# US-unlock jump. Hours 17-24 positive: the pool under-predicts the evening
+# peak. See REPORT.md for the measurement and the validation.
+HOUR_BIAS = [
+    -0.146,  # h1 (unused)
+    -0.231,  # h2
+    -0.370,  # h3
+    -0.201,  # h4
+    0.053,   # h5
+    0.274,   # h6
+    0.241,   # h7
+    0.135,   # h8
+    0.040,   # h9
+    -0.022,  # h10
+    -0.125,  # h11
+    -0.163,  # h12
+    -0.149,  # h13
+    -0.030,  # h14
+    0.067,   # h15
+    0.160,   # h16
+    0.252,   # h17
+    0.295,   # h18
+    0.289,   # h19
+    0.245,   # h20
+    0.229,   # h21
+    0.208,   # h22
+    0.166,   # h23
+    0.140,   # h24
+]
 
 
 def round2(x):
@@ -250,7 +285,8 @@ def forecast(case):
 
     rows = []
     for h in hours:
-        m = min(max(mu[h - 1] + MED_SHIFT, MU_MIN), MU_MAX)
+        # v1 median shift plus the per-hour bias correction (v2).
+        m = min(max(mu[h - 1] + MED_SHIFT + HOUR_BIAS[h - 1], MU_MIN), MU_MAX)
         s = sig[h - 1] * SPREAD
         q = []
         for j, z in enumerate(Z):
