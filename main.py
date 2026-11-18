@@ -1,382 +1,393 @@
-#!/usr/bin/env python3
-"""Hourly Twitch viewership forecast for a game launch (hours 2-24)."""
+"""GTA VI launch-day Twitch CCU forecaster (v7).
 
+Given one case file (schema makefun/twitch-ccu-case/v1) this program
+writes the forecast for hours 2..24 as five quantiles per hour.
+
+How it works (v7 = v6 F2b, ridge 0.5 -> 1.6, upper width 1.25 -> 1.20):
+for every hour of the launch day, a ridge regression predicts
+log(viewers / hour-1) from a quadratic in standardised log hour-1 plus
+five pre-release covariates [x2, x3, x4, x10, x11], fitted on the past
+big launches listed in the case file itself. Evening hours (17-24) are
+fit without shrinkage. The fitted median is shifted +0.15 in log space
+and dressed with normal quantiles whose width follows the per-hour
+residual scale. A fixed practice correction (the median log-miss of
+this model on the four published practice launches) is then applied:
+full strength at hours 5-6 with size damping for big targets, and a
+blend of the practice correction with the pool's own rolling-miss
+elsewhere (pure practice correction for small targets). If anything
+goes wrong the house baseline is emitted instead, so the output is
+always a valid 23-row forecast.
+
+Standard library only. No clock, no randomness: the same input always
+gives the same bytes. About half a second per case.
+
+Usage: python3 main.py <case.in> <case.out>
+   or: python3 main.py            (reads /input/*.in, writes /output/*.out)
+"""
 import datetime
-import glob
 import json
 import math
 import os
 import sys
 
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
-FEATS = ["x2", "x3", "x4", "x10", "x11"]
-LAM = 0.5
-LAM_EVENING = 0.0
-EVENING_FROM = 16
-SHIFT = 0.15
-SPREAD = 0.32
-UPPER = 1.25
-BLEND = 0.8
-SMALL_P1 = 50000.0
-DAMP_K = 2.0
-DAMP_REF = 120000.0
-FULL_HOURS = (5, 6)
-MIXED = ("ELDEN RING", "Cyberpunk 2077", "Monster Hunter Wilds")
-PRACTICE_BIAS = [
-    0.012, -0.176, -0.229, -0.244, 0.279, 0.323, 0.203, 0.094,
-    0.02, -0.055, -0.072, -0.182, -0.19, -0.129, -0.034, -0.011,
-    0.124, 0.27, 0.228, 0.239, 0.264, 0.271, 0.213, 0.205,
-]
+QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
+Z_SCORES = [-1.645, -0.674, 0.0, 0.674, 1.645]
+
+RIDGE = 1.6              # shrinkage on the quadratic + covariate terms
+RIDGE_EVENING = 0.0      # shrinkage for hours 17-24 (fit unshrunk)
+EVENING_FROM = 16        # 0-based hour index where the evening starts
+WIDTH = 0.32             # quantile half-width multiplier on residual scale
+UPPER_WIDTH = 1.20       # extra width on the two upper quantiles
+MEDIAN_SHIFT = 0.15      # constant log-shift on the fitted median
+PRACTICE_WEIGHT = 0.8    # practice-correction weight outside hours 5-6
+DAMP_STRENGTH = 2.0      # size damping for the hours 5-6 correction
+DAMP_REFERENCE = 120000.0
+SMALL_TARGET = 50000.0   # below this hour-1 the correction is used pure
+FEATURES = ["x2", "x3", "x4", "x10", "x11"]
+EXCLUDED = ["ELDEN RING", "Cyberpunk 2077", "Monster Hunter Wilds"]
+
+# Median per-hour log-miss (log actual - log q50) of this model on the
+# four published practice launches, smoothed and shrunk 0.8 toward its
+# grand mean. Entries are hours 1..24.
+PRACTICE_BIAS = [0.012, -0.176, -0.236, -0.253, 0.284, 0.32, 0.215, 0.098,
+                 0.025, -0.059, -0.054, -0.178, -0.184, -0.122, -0.026,
+                 -0.016, 0.128, 0.27, 0.228, 0.239, 0.264, 0.272, 0.214, 0.205]
 
 
-def run():
-    src = find_case()
-    if len(sys.argv) > 2:
-        dst = sys.argv[2]
-    else:
-        stem = os.path.splitext(os.path.basename(src))[0]
-        dst = os.path.join("/output", stem + ".out")
-        if not os.path.isdir("/output"):
-            dst = stem + ".out"
-    try:
-        with open(src) as fh:
-            case = json.load(fh)
-        p1 = hour1(case)
-        result = predict(case, p1)
-    except Exception:
-        try:
-            with open(src) as fh:
-                case = json.load(fh)
-            p1 = hour1(case)
-        except Exception:
-            p1 = 1000.0
-        result = flat_forecast(p1)
-    check(result)
-    folder = os.path.dirname(dst)
-    if folder:
-        os.makedirs(folder, exist_ok=True)
-    with open(dst, "w") as fh:
-        json.dump(result, fh, separators=(",", ":"))
-        fh.write("\n")
+# --------------------------------------------------------------------- small
+def mid(values):
+    ordered = sorted(values)
+    n = len(ordered)
+    if n == 0:
+        return 0.0
+    if n % 2:
+        return ordered[n // 2]
+    return 0.5 * (ordered[n // 2 - 1] + ordered[n // 2])
 
 
-def find_case():
-    if len(sys.argv) > 1:
-        return sys.argv[1]
-    for pattern in ("/input/*.in", "*.in", "input/*.in"):
-        found = sorted(glob.glob(pattern))
-        if found:
-            return found[0]
-    raise FileNotFoundError("no case file found")
+def sd(values, mean):
+    if len(values) < 2:
+        return 0.0
+    return math.sqrt(sum((v - mean) ** 2 for v in values) / len(values))
 
 
-def hour1(case):
-    for k in case.get("known") or []:
-        if k.get("hour") == 1 and k.get("viewers"):
-            return max(1, k["viewers"])
-    hist = case.get("history_hourly") or []
-    if hist and hist[0].get("viewers"):
-        return max(1, hist[0]["viewers"])
-    raise ValueError("no hour-1 viewers in case")
+def moving_avg(values, win):
+    if win <= 1:
+        return list(values)
+    half = win // 2
+    smoothed = []
+    for i in range(len(values)):
+        lo = max(0, i - half)
+        hi = min(len(values), i + half + 1)
+        smoothed.append(sum(values[lo:hi]) / (hi - lo))
+    return smoothed
 
 
-def predict(case, p1):
-    pool = build_pool(case)
-    if len(pool) < 6:
-        raise ValueError("comparable pool too small")
-    feats = target_feats(case, p1)
-    means = pool_means(pool)
-    cov = [feats[k] if feats[k] is not None else means[k] for k in FEATS]
-    base = base_rows(pool, p1, cov)
-    return apply_bias(base, bias_for(pool, p1))
+def gauss_solve(matrix, rhs):
+    """Solve a small dense linear system by Gaussian elimination."""
+    n = len(rhs)
+    aug = [row[:] + [rhs[i]] for i, row in enumerate(matrix)]
+    for col in range(n):
+        pivot = max(range(col, n), key=lambda r: abs(aug[r][col]))
+        if abs(aug[pivot][col]) < 1e-12:
+            return None
+        aug[col], aug[pivot] = aug[pivot], aug[col]
+        for row in range(col + 1, n):
+            factor = aug[row][col] / aug[col][col]
+            for c in range(col, n + 1):
+                aug[row][c] -= factor * aug[col][c]
+    sol = [0.0] * n
+    for i in range(n - 1, -1, -1):
+        sol[i] = (aug[i][n] - sum(aug[i][j] * sol[j] for j in range(i + 1, n))) / aug[i][i]
+    return sol
 
 
-def flat_forecast(p1):
-    rows = []
-    for h in range(2, 25):
-        q = []
-        for z in Z:
-            v = p1 * math.exp(z * 0.15 * math.sqrt(h - 1))
-            q.append(min(max(round(v, 2), 1.0), 1e9))
-        rows.append({"hour": h, "q": sorted(q)})
-    return {"hours": rows}
+def ridge_fit(design, targets, weights, penalties):
+    """Weighted ridge regression; returns the coefficient vector or None."""
+    width = len(design[0])
+    normal = [[0.0] * width for _ in range(width)]
+    moment = [0.0] * width
+    for row, y, w in zip(design, targets, weights):
+        for i in range(width):
+            moment[i] += w * row[i] * y
+            for j in range(width):
+                normal[i][j] += w * row[i] * row[j]
+    if penalties:
+        for i in range(width):
+            normal[i][i] += penalties[i]
+    return gauss_solve(normal, moment)
 
 
-def check(result):
-    hours = result["hours"]
-    if len(hours) != 23:
-        raise ValueError("must be 23 rows")
-    for i, r in enumerate(hours):
-        if r["hour"] != i + 2:
-            raise ValueError("hours must be 2..24")
-        q = r["q"]
-        if len(q) != 5:
-            raise ValueError("five quantiles per hour")
-        for j, v in enumerate(q):
-            if not math.isfinite(v) or v < 1.0 or v > 1e9:
-                raise ValueError("quantile out of range")
-            if j and v < q[j - 1]:
-                raise ValueError("quantiles must be non-decreasing")
+# --------------------------------------------------------------------- input
+def launch_day(comp):
+    """The 24 hourly viewer counts of a comparable's launch day."""
+    day = comp["day_start"][:10]
+    hours = {}
+    for point in comp["hourly"]:
+        if point["from"][:10] == day:
+            hours[int(point["from"][11:13])] = point["viewers"]
+    if 0 not in hours or not hours[0]:
+        return None
+    return [hours.get(h) for h in range(24)]
 
 
-def to_time(text):
-    return datetime.datetime.fromisoformat(str(text).replace("Z", "+00:00"))
+def history_stats(hourly, day_start):
+    """Pre-release shape: 7-day peak/mean/slope/vol, 3-day slope/vol."""
+    start = datetime.datetime.fromisoformat(day_start.replace("Z", "+00:00"))
+    week, three = [], []
+    for point in hourly:
+        viewers = point.get("viewers")
+        if viewers is None or viewers <= 0:
+            continue
+        when = datetime.datetime.fromisoformat(point["from"].replace("Z", "+00:00"))
+        if when < start:
+            age = (start - when).total_seconds()
+            if age <= 7 * 86400:
+                week.append((age / 86400.0, math.log(viewers), viewers))
+            if age <= 3 * 86400:
+                three.append((age / 86400.0, math.log(viewers), viewers))
+    if not week:
+        return None, None, None, None, None, None
+
+    def trend(points):
+        n = len(points)
+        if n < 2:
+            return 0.0, 0.0
+        mx = sum(d for d, _, _ in points) / n
+        my = sum(y for _, y, _ in points) / n
+        sxx = sum((d - mx) ** 2 for d, _, _ in points)
+        sxy = sum((d - mx) * (y - my) for d, y, _ in points)
+        slope = sxy / sxx if sxx > 1e-9 else 0.0
+        spread = math.sqrt(sum((y - my) ** 2 for _, y, _ in points) / n)
+        return slope, spread
+
+    peak = max(v for _, _, v in week)
+    recent = [v for d, _, v in week if d <= 1.0]
+    mean = sum(recent) / len(recent) if recent else None
+    slope7, vol7 = trend(week)
+    slope3, vol3 = trend(three)
+    return peak, mean, slope7, vol7, slope3, vol3
 
 
-def regime_of(unlock_text):
-    u = str(unlock_text).lower()
-    if "rolling" in u or "midnight local" in u:
+def unlock_kind(text):
+    lowered = str(text).lower()
+    if "rolling" in lowered or "midnight local" in lowered:
         return "rolling"
-    if "single global" in u or "simultaneous global" in u or "simultaneous across" in u:
+    if "single global" in lowered or "simultaneous global" in lowered or "simultaneous across" in lowered:
         return "simultaneous"
     return "unknown"
 
 
-def curve_of(comp):
-    day = str(comp.get("day_start", ""))[:10]
-    by_hour = {}
-    for pt in comp.get("hourly") or []:
-        if str(pt.get("from", ""))[:10] == day:
-            try:
-                by_hour[int(str(pt["from"])[11:13])] = pt.get("viewers")
-            except (ValueError, IndexError):
-                continue
-    if not by_hour.get(0):
-        return None
-    return [by_hour.get(h) for h in range(24)]
-
-
-def features_of(hourly, day_start, p1):
-    ds = to_time(day_start)
-    pts = []
-    for pt in hourly or []:
-        v = pt.get("viewers")
-        if v is None or v <= 0:
-            continue
-        try:
-            t = to_time(pt["from"])
-        except ValueError:
-            continue
-        if t < ds:
-            dt = (ds - t).total_seconds() / 86400.0
-            if dt <= 7.0:
-                pts.append((dt, math.log(v), v))
-    if not pts:
-        return {"x2": None, "x3": None, "x4": None, "x5": None, "x10": None, "x11": None}
-    peak = max(v for _, _, v in pts)
-    last24 = [v for d, _, v in pts if d <= 1.0]
-    mean24 = sum(last24) / len(last24) if last24 else None
-    n = len(pts)
-    if n < 2:
-        slope, vol = 0.0, 0.0
-    else:
-        mx = sum(d for d, _, _ in pts) / n
-        my = sum(y for _, y, _ in pts) / n
-        sxx = sum((d - mx) ** 2 for d, _, _ in pts)
-        sxy = sum((d - mx) * (y - my) for d, y, _ in pts)
-        slope = sxy / sxx if sxx > 1e-9 else 0.0
-        vol = math.sqrt(sum((y - my) ** 2 for _, y, _ in pts) / n)
-    x2 = math.log(peak / p1) if peak else None
-    x3 = math.log(mean24 / p1) if mean24 else None
-    x10 = slope * vol if slope is not None and vol is not None else None
-    return {"x2": x2, "x3": x3, "x4": slope, "x5": vol, "x10": x10,
-            "x11": x2 * x2 if x2 is not None else None}
-
-
-def build_pool(case):
-    pool = []
-    for comp in case.get("comparables") or []:
+def collect_launches(case):
+    """Past launches from the case file's comparables (the GTA VI
+    category itself is not a launch: its premiere day has no hour 0)."""
+    launches = []
+    for comp in case["comparables"]:
         name = str(comp.get("name", ""))
         if "Grand Theft Auto VI" in name:
             continue
-        curve = curve_of(comp)
+        curve = launch_day(comp)
         if curve is None:
             continue
-        pool.append({
-            "name": name, "p1": curve[0], "curve": curve,
-            "feats": features_of(comp.get("hourly"), comp.get("day_start"), curve[0]),
-            "regime": regime_of(comp.get("unlock", "")),
+        peak, mean, slope7, vol7, _slope3, _vol3 = history_stats(comp["hourly"], comp["day_start"])
+        hour1 = curve[0]
+        pre_peak = math.log(peak / hour1) if peak else None
+        pre_mean = math.log(mean / hour1) if mean else None
+        interaction = (slope7 * vol7) if (slope7 is not None and vol7 is not None) else None
+        launches.append({
+            "name": name, "p1": hour1, "curve": curve,
+            "regime": unlock_kind(comp.get("unlock", "")),
+            "x2": pre_peak, "x3": pre_mean, "x4": slope7, "x10": interaction,
+            "x11": (pre_peak * pre_peak) if pre_peak is not None else None,
+            "x8": 0.0 if "PC" in str(comp.get("platforms", "")) else 1.0,
         })
-    pool.sort(key=lambda p: p["name"])
-    return pool
+    return launches
 
 
-def target_feats(case, p1):
-    return features_of(case.get("history_hourly"), case.get("day_start"), p1)
+def target_stats(case):
+    """The target's hour-1 viewers and pre-release covariates."""
+    peak, mean, slope7, vol7, _slope3, _vol3 = history_stats(case["history_hourly"], case["day_start"])
+    hour1 = max(1, next(k["viewers"] for k in case["known"] if k["hour"] == 1))
+    pre_peak = math.log(peak / hour1) if peak else None
+    pre_mean = math.log(mean / hour1) if mean else None
+    interaction = (slope7 * vol7) if (slope7 is not None and vol7 is not None) else None
+    return {"p1": hour1, "x2": pre_peak, "x3": pre_mean, "x4": slope7,
+            "x10": interaction,
+            "x11": (pre_peak * pre_peak) if pre_peak is not None else None}
 
 
-def pool_means(pool):
-    means = {}
-    for k in FEATS:
-        vals = [p["feats"][k] for p in pool if p["feats"][k] is not None]
-        means[k] = sum(vals) / len(vals) if vals else 0.0
-    return means
+# --------------------------------------------------------------------- model
+def hourly_fit(launches, log_p1, covariates):
+    """Fit log(curve[h]/p1) for each hour; returns (median[24], scale[24]).
 
-
-def gauss_solve(mat, vec):
-    n = len(vec)
-    a = [row[:] + [vec[i]] for i, row in enumerate(mat)]
-    for i in range(n):
-        piv = max(range(i, n), key=lambda r: abs(a[r][i]))
-        if abs(a[piv][i]) < 1e-12:
-            return None
-        a[i], a[piv] = a[piv], a[i]
-        for r in range(i + 1, n):
-            f = a[r][i] / a[i][i]
-            for c in range(i, n + 1):
-                a[r][c] -= f * a[i][c]
-    out = [0.0] * n
-    for i in range(n - 1, -1, -1):
-        out[i] = (a[i][n] - sum(a[i][j] * out[j] for j in range(i + 1, n))) / a[i][i]
-    return out
-
-
-def fit_ridge(rows, ys, ridge):
-    k = len(rows[0])
-    mat = [[0.0] * k for _ in range(k)]
-    vec = [0.0] * k
-    for xi, yi in zip(rows, ys):
-        for i in range(k):
-            vec[i] += xi[i] * yi
-            for j in range(k):
-                mat[i][j] += xi[i] * xi[j]
-    for i in range(k):
-        mat[i][i] += ridge[i]
-    return gauss_solve(mat, vec)
-
-
-def med(vals):
-    v = sorted(vals)
-    n = len(v)
-    if n == 0:
-        return 0.0
-    return v[n // 2] if n % 2 else 0.5 * (v[n // 2 - 1] + v[n // 2])
-
-
-def sd(vals, mean):
-    if len(vals) < 2:
-        return 0.0
-    return math.sqrt(sum((v - mean) ** 2 for v in vals) / len(vals))
-
-
-def smooth(vals):
-    out = []
-    for i in range(len(vals)):
-        lo = max(0, i - 1)
-        hi = min(len(vals), i + 2)
-        out.append(sum(vals[lo:hi]) / (hi - lo))
-    return out
-
-
-def fit_mu_sigma(pool, log_p1, cov):
-    xs = [math.log(p["p1"]) for p in pool]
-    xbar = sum(xs) / len(xs)
-    xsd = sd(xs, xbar) or 1.0
-    # usable (row, log-ratio) pairs per hour, built in one pass
-    per_hour = [[] for _ in range(24)]
-    for p in pool:
-        if not all(p["feats"][k] is not None for k in FEATS):
-            continue
-        u = (math.log(p["p1"]) - xbar) / xsd
-        row = [1.0, u, u * u] + [p["feats"][k] for k in FEATS]
-        for h in range(24):
-            v = p["curve"][h]
-            if v is not None and v > 0:
-                per_hour[h].append((row, math.log(v / p["p1"])))
-    mu, sig = [], []
+    A missing target covariate is filled with the pool mean, never 0.
+    """
+    log_sizes = [math.log(p["p1"]) for p in launches]
+    centre = sum(log_sizes) / len(log_sizes)
+    scale = sd(log_sizes, centre) or 1.0
+    pool_avg = {}
+    for key in FEATURES:
+        present = [p[key] for p in launches if p[key] is not None]
+        pool_avg[key] = sum(present) / len(present) if present else 0.0
+    filled = [covariates[i] if covariates[i] is not None else pool_avg[FEATURES[i]]
+              for i in range(len(FEATURES))]
+    u_eval = (log_p1 - centre) / scale
+    medians, scales = [], []
     for h in range(24):
-        pts = per_hour[h]
-        if len(pts) < 6:
-            mu.append(0.0)
-            sig.append(0.5)
+        usable = [(p, math.log(p["curve"][h] / p["p1"])) for p in launches
+                  if p["curve"][h] is not None and p["curve"][h] > 0
+                  and all(p[key] is not None for key in FEATURES)]
+        if len(usable) < 6:
+            medians.append(0.0)
+            scales.append(0.5)
             continue
-        lh = LAM if h < EVENING_FROM else LAM_EVENING
-        ridge = [0.0, lh, lh] + [lh] * len(FEATS)
-        beta = fit_ridge([r for r, _ in pts], [y for _, y in pts], ridge)
-        if beta is None:
-            ys = [y for _, y in pts]
-            m0 = med(ys)
-            mu.append(m0)
-            sig.append(max(sd(ys, m0), 0.15))
+        design, targets = [], []
+        for launch, log_ratio in usable:
+            u = (math.log(launch["p1"]) - centre) / scale
+            design.append([1.0, u, u * u] + [launch[key] for key in FEATURES])
+            targets.append(log_ratio)
+        penalty = RIDGE if h < EVENING_FROM else RIDGE_EVENING
+        coeffs = ridge_fit(design, targets, [1.0] * len(design),
+                           [0.0, penalty, penalty] + [penalty] * len(FEATURES))
+        if coeffs is None:
+            middle = mid(targets)
+            medians.append(middle)
+            scales.append(max(sd(targets, middle), 0.15))
             continue
-        ue = (log_p1 - xbar) / xsd
-        ev = [1.0, ue, ue * ue] + list(cov)
-        mu.append(sum(b * v for b, v in zip(beta, ev)))
-        resid = [y - sum(b * v for b, v in zip(beta, r)) for r, y in pts]
-        rm = sum(resid) / len(resid)
-        var = sum((r - rm) ** 2 for r in resid) / len(resid)
-        sig.append(max(math.sqrt(var), 0.15))
-    return smooth(mu), smooth(sig)
+        probe = [1.0, u_eval, u_eval * u_eval] + filled
+        medians.append(sum(b * v for b, v in zip(coeffs, probe)))
+        errors = [y - sum(b * v for b, v in zip(coeffs, row))
+                  for row, y in zip(design, targets)]
+        err_mean = sum(errors) / len(errors)
+        variance = sum((e - err_mean) ** 2 for e in errors) / len(errors)
+        scales.append(max(math.sqrt(variance), 0.15))
+    return moving_avg(medians, 3), moving_avg(scales, 3)
 
 
-def base_rows(pool, p1, cov):
-    mu, sig = fit_mu_sigma(pool, math.log(p1), cov)
-    mu = [m + SHIFT for m in mu]
+def quantile_table(p1, medians, scales):
+    """Turn a fitted (median, scale) pair into the 23 output rows."""
     rows = []
     for h in range(2, 25):
-        q = []
-        for j, z in enumerate(Z):
-            off = z * sig[h - 1] * SPREAD * (UPPER if j >= 3 else 1.0)
-            v = p1 * math.exp(min(max(mu[h - 1] + off, -1.2), 2.6))
-            q.append(min(max(v, 1.0), 1e9))
-        q = sorted(round(v, 2) for v in q)
+        quants = []
+        for j, z in enumerate(Z_SCORES):
+            offset = z * scales[h - 1] * WIDTH * (UPPER_WIDTH if j >= 3 else 1.0)
+            value = p1 * math.exp(min(max(medians[h - 1] + offset, -1.2), 2.6))
+            quants.append(min(max(value, 1.0), 1e9))
+        quants = sorted(round(v, 2) if v != int(v) else v for v in quants)
         for j in range(1, 5):
-            if q[j] < q[j - 1]:
-                q[j] = q[j - 1]
-        rows.append({"hour": h, "q": q})
+            if quants[j] < quants[j - 1]:
+                quants[j] = quants[j - 1]
+        rows.append({"hour": h, "q": quants})
     return {"hours": rows}
 
 
-def rolling_miss(pool):
-    rolling = [p for p in pool if p["regime"] == "rolling" and p["name"] not in MIXED]
+def leave_one_miss(launches):
+    """Median per-hour log-miss of the base model on the pool's rolling
+    launches, each predicted from all the others (mixed excluded)."""
+    rolling = [p for p in launches if p["regime"] == "rolling" and p["name"] not in EXCLUDED]
     if len(rolling) < 3:
         return None
     per_hour = [[] for _ in range(24)]
-    for target in rolling:
-        sub = [p for p in pool if p["name"] != target["name"]]
-        if len(sub) < 6:
+    for held in rolling:
+        rest = [p for p in launches if p["name"] != held["name"]]
+        if len(rest) < 6:
             continue
-        means = pool_means(sub)
-        cov = [target["feats"][k] if target["feats"][k] is not None else means[k]
-               for k in FEATS]
-        out = base_rows(sub, target["p1"], cov)
-        rows = {r["hour"]: r["q"] for r in out["hours"]}
-        for h in range(2, 25):
-            actual = target["curve"][h - 1]
+        medians, _scales = hourly_fit(rest, math.log(held["p1"]), [held[key] for key in FEATURES])
+        medians = [m + MEDIAN_SHIFT for m in medians]
+        for hh in range(2, 25):
+            actual = held["curve"][hh - 1]
             if actual is None or actual <= 0:
                 continue
-            per_hour[h - 1].append(
-                math.log(max(1, actual)) - math.log(max(1e-9, rows[h][2])))
-    return [med(v) if v else 0.0 for v in per_hour]
+            guess = held["p1"] * math.exp(min(max(medians[hh - 1], -1.2), 2.6))
+            per_hour[hh - 1].append(math.log(max(1, actual)) - math.log(max(1e-9, guess)))
+    return [mid(v) if v else 0.0 for v in per_hour]
 
 
-def bias_for(pool, p1):
-    miss = rolling_miss(pool)
-    damp = 1.0 / (1.0 + DAMP_K * max(0.0, math.log(p1 / DAMP_REF)))
-    w = 1.0 if p1 < SMALL_P1 else BLEND
-    weights = []
-    for h in range(24):
-        if miss is None or (h + 1) in FULL_HOURS:
-            weights.append((1.0, 0.0, damp if (h + 1) in FULL_HOURS and miss is not None else 1.0))
+def nudge_rows(table, p1, miss):
+    """Apply the practice correction to finished rows (log-multiplicative).
+
+    Hours 5-6 take the full correction, damped for large targets; other
+    hours blend it with the pooled rolling miss (pure correction for
+    small targets)."""
+    shifted = []
+    for row in table["hours"]:
+        h = row["hour"]
+        if h in (5, 6):
+            amount = PRACTICE_BIAS[h - 1]
+            amount = amount / (1.0 + DAMP_STRENGTH * max(0.0, math.log(p1 / DAMP_REFERENCE)))
+        elif p1 < SMALL_TARGET:
+            amount = PRACTICE_BIAS[h - 1]
         else:
-            weights.append((w, 1.0 - w, 1.0))
-    return [wp * PRACTICE_BIAS[h] * d + wm * (miss[h] if miss is not None else 0.0)
-            for h, (wp, wm, d) in enumerate(weights)]
+            amount = PRACTICE_WEIGHT * PRACTICE_BIAS[h - 1] + (1.0 - PRACTICE_WEIGHT) * miss[h - 1]
+        factor = math.exp(amount)
+        shifted.append({"hour": h, "q": [max(1.0, min(1e9, v * factor)) for v in row["q"]]})
+    return {"hours": shifted}
 
 
-def apply_bias(rows, bias):
-    out = []
-    for r in rows["hours"]:
-        h = r["hour"]
-        q = [min(max(v * math.exp(bias[h - 1]), 1.0), 1e9) for v in r["q"]]
-        q = sorted(q)
-        for j in range(1, 5):
-            if q[j] < q[j - 1]:
-                q[j] = q[j - 1]
-        out.append({"hour": h, "q": q})
-    return {"hours": out}
+def baseline_table(p1):
+    """House baseline: flat at hour 1, spread widening with sqrt(h-1)."""
+    rows = []
+    for h in range(2, 25):
+        rows.append({"hour": h, "q": [max(1.0, min(1e9, p1 * math.exp(z * 0.15 * math.sqrt(h - 1)))) for z in Z_SCORES]})
+    return {"hours": rows}
+
+
+def predict_case(case):
+    """The whole forecast for one parsed case file."""
+    launches = collect_launches(case)
+    if len(launches) < 6:
+        raise ValueError("too few comparables")
+    target = target_stats(case)
+    p1 = target["p1"]
+    medians, scales = hourly_fit(launches, math.log(p1), [target[key] for key in FEATURES])
+    medians = [m + MEDIAN_SHIFT for m in medians]
+    table = quantile_table(p1, medians, scales)
+    miss = leave_one_miss(launches)
+    if miss is None:
+        miss = [0.0] * 24
+    return nudge_rows(table, p1, miss)
+
+
+# --------------------------------------------------------------------- driver
+def process_file(in_path, out_path):
+    with open(in_path) as handle:
+        case = json.load(handle)
+    try:
+        result = predict_case(case)
+    except Exception:
+        hour1 = 1
+        try:
+            hour1 = max(1, next(k["viewers"] for k in case["known"] if k["hour"] == 1))
+        except Exception:
+            pass
+        result = baseline_table(hour1)
+    try:
+        assert sorted(r["hour"] for r in result["hours"]) == list(range(2, 25))
+        for row in result["hours"]:
+            assert len(row["q"]) == 5
+            assert all(0 < v <= 1e9 and math.isfinite(v) for v in row["q"])
+            assert all(row["q"][j] <= row["q"][j + 1] for j in range(4))
+    except Exception:
+        hour1 = max(1, next(k["viewers"] for k in case["known"] if k["hour"] == 1))
+        result = baseline_table(hour1)
+    with open(out_path, "w") as handle:
+        json.dump(result, handle)
+
+
+def main(argv):
+    if len(argv) == 3:
+        process_file(argv[1], argv[2])
+        return 0
+    if len(argv) == 1:
+        os.makedirs("/output", exist_ok=True)
+        for name in sorted(os.listdir("/input")):
+            if name.endswith(".in"):
+                process_file(os.path.join("/input", name),
+                             os.path.join("/output", name[:-3] + ".out"))
+        return 0
+    sys.stderr.write("usage: main.py [case.in case.out]\n")
+    return 2
 
 
 if __name__ == "__main__":
-    run()
+    sys.exit(main(sys.argv))
